@@ -1,0 +1,634 @@
+# Masting analyses of mastree data with different duration thresholds and unit type combinations
+# 1. Phylogenetic signal
+# 2. Trait-dependent evolution
+# 3. Compares age and macroevolutionary rates of mastreee data to other species in the SMith and Brown GBOTB phylogeny
+# 4. Cluster analysis based on masting matrics
+# 5. Compare synchrony, latitude, and macro rates between clusters
+# Written by Esther Dale Feb 2021
+
+#required packages and functions
+
+library(ape)
+library(caper)
+library(cluster)
+library(BAMMtools)
+library(dplyr)
+library(geiger)
+library(phytools)
+library(picante)
+library(phylolm)
+library(tidyr)
+
+source("DRmetric.R")
+source("essim function.R")
+source("Tip ages function.R")
+source("Plot text rounding functions.R")
+
+###############################################
+############### prep files#####################
+###############################################
+masting.datasets <-list.files(pattern="Masting data names checked .") #masting data for different durations/unit types
+masting.phylos <-list.files(pattern="Masting phylogeny .")
+
+#load BAMM object for Smith and Brown phylogeny
+Smith.Brown.BAMM <- readRDS("SmithBrown_BAMM_vascular.RDS")
+#BAMM object from Igea & Tanentzap 2020 https://github.com/javierigea/LDGplants_rates
+
+#df with original tip label info so can match tips in SmithBrown.BAMM
+tip.labs.checked <- readRDS("TPL output GBOTB names masting genera.Rdata")
+  #tip.labs.checked$Taxon are the original names
+
+# seed size evolution BAMM
+seed.BAMM.full <- readRDS("Trait_edata_50shifts_1000samples.Rsave")
+#BAMM object from Igea et al. 2017 https://github.com/javierigea/seed_size
+seed.names<- readRDS("Seed names checked.Rdata")
+  #seed.names$Taxon are the original names from the bamm object
+
+# Smith and Brown GBOTB phylogeny
+Smith.brown.tree <- read.tree("GBOTB.tre")
+#phylogeny from Smith & Brown 2018
+
+# DR values for Smith and Brown phylogeny
+  #this takes 5+ hours
+smith.brownDR <- DR_statistic(Smith.brown.tree)
+
+# prep age, lambda, beta, and dr rates for tips
+tip.evolution.df <- calculate_tip_ages(Smith.brown.tree)
+bamm.rates <- getTipRates(Smith.Brown.BAMM)
+tip.evolution.df$lambda <- bamm.rates$lambda.avg[match(unlist(tip.evolution.df$tip), names(bamm.rates$lambda.avg))]
+seed.rates <- getTipRates(seed.BAMM.full)
+tip.evolution.df$beta <- seed.rates$beta.avg[match(unlist(tip.evolution.df$tip), names(seed.rates$beta.avg))]
+tip.evolution.df$dr <- smith.brownDR[match(unlist(tip.evolution.df$tip), names(smith.brownDR))]
+tip.evolution.df$tip.age <- as.numeric(as.character(tip.evolution.df$tip.age))
+rownames(tip.evolution.df) <- tip.evolution.df$tip
+tip.evolution.df$tip <- as.character(tip.evolution.df$tip)
+
+###################################################
+###################################################
+for(j in 1:length(masting.datasets)){
+
+mast.df <- as.data.frame(readRDS(masting.datasets[j]))
+rownames(mast.df) <- gsub(" ", "_", mast.df$Species)
+
+duration <- as.numeric(substr(masting.datasets[j], 28, 28)) #number of years minimum duration threshold
+unit.type <- rep(c("area", "count", "individual", "mass", "full"),4)[j]
+
+phylo <- read.tree(masting.phylos[duration-2])
+phylo <- keep.tip(phylo, tip = unique(gsub(" ", "_", mast.df$Species)))
+phylo$node.label <- NA
+
+################################################
+########### 1. Phylogenetic signal #############
+################################################
+
+ #vars to have phylogenetic signal tested
+ vars <- colnames(mast.df)[c(4,6,15:16)]
+
+ #sets up empty dataframe for phylogenetic signal results
+   # var=variable, K.stat= Blomberg's K statistic, K.sd=standard deviation of K, K.p=p value testing significance of k
+ K.results <- data.frame("Var"=character(), "Method"=character(),"Stat.without.se"=numeric(), "Stat.with.se"=numeric(), "sigma.sq"=numeric(),
+                         "p.without.se"=numeric(), "p.with.se"=numeric(), "n.without.se"=numeric(), "n.with.se"=numeric(), stringsAsFactors = F)
+
+ # loops through variables
+ for(i in 1:length(vars)){
+   rows.i <- (2*i-1):(2*i)
+   col.sd <- grep(gsub("mean", "sd", vars[i]), colnames(mast.df))[1] #std dev column for var i
+
+   #full data
+   mast.i <- mast.df[,c(1, grep(vars[i], colnames(mast.df))[1])]
+   mast.i$Species <- gsub(" ", "_", mast.i$Species)
+   phylo.i <- keep.tip(phylo, tip=mast.i$Species)
+   mast.cd <- comparative.data(phylo.i, mast.i, names.col=Species)
+
+   #for data with std dev - want only species with std dev value >0 and std dev not more than 5x higher than mean
+   rows.sd <- complete.cases(mast.df[,col.sd])&mast.df[,col.sd]>0 & (abs(mast.df[,col.sd]/mast.i[,2]))<5
+   mast.i.se <- mast.df[rows.sd,c(1, grep(vars[i], colnames(mast.df))[1], col.sd, 8)]
+   mast.i.se$Species <-  gsub(" ", "_", mast.i.se$Species)
+   #make column with std error
+   mast.i.se$se <- mast.i.se[,3]/sqrt(mast.i.se$n_timeseries)
+   phylo.se <-  keep.tip(phylo, tip=mast.i.se$Species)
+   phylo.se$node.label <- NA
+   mast.se.cd <- comparative.data(phylo.se, mast.i.se, names.col = Species)
+
+   #k with and without std err
+   K.i.se <- phylosig(mast.se.cd$phy, mast.se.cd$data[,1],se=mast.se.cd$data$se, method="K", test = T)
+   K.i <- phylosig(mast.se.cd$phy, mast.se.cd$data[,1], method="K", test = T)
+
+   # lambda with and without standard error
+       #if model throws an error then try different starting values of lambda, and if that doesn't work, different fixed values of lambda and picks best option
+   yy <- mast.se.cd$data[,1]
+   y2 <- mast.cd$data[,1]
+   ee <- 1/mast.se.cd$data$se
+
+   lamb.se <- tryCatch({ gls(yy ~ 1, correlation=corPagel(0.5, mast.se.cd$phy,fixed=F), method="ML", weights=varFixed(~ee)) }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+   if(is.null(lamb.se)){
+     lamb.se <- lapply( seq(0,1,length.out=11), function(y){tryCatch({gls(yy ~ 1, correlation=corPagel(y, mast.se.cd$phy,fixed=F), method="ML", weights=varFixed(~ee))},error=function(e){cat("ERROR :",conditionMessage(e), "\n")}) })
+     if(all(sapply(lamb.se, is.null) == T)){
+       lamb.se <- lapply( seq(0,1,length.out=11), function(y){tryCatch({gls(yy ~ 1, correlation=corPagel(y, mast.se.cd$phy,fixed=T), method="ML", weights=varFixed(~ee)) }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")}) })
+     }
+     lamb.se <- lamb.se[which(sapply(lamb.se, is.null) == F)][[which.min(sapply(lamb.se[which(sapply(lamb.se, is.null) == F)],AIC))]]
+   }
+   try(if(summary(lamb.se)$modelStruct[1]<0){
+    lamb.se <- try(gls(yy ~ 1, correlation=corPagel(0,mast.se.cd$phy,fixed=T), method="ML"))
+   })
+   lamb.null.se <- gls(yy~1, method="ML", weights=varFixed(~ee))
+   lamb.test.se <- try(anova(lamb.null.se, lamb.se))
+   lamb.se.p <- try(lamb.test.se$`p-value`[2])
+   if(is.null(lamb.se.p)){lamb.se.p <- 1}
+
+  lamb.i <- tryCatch({ gls(y2 ~ 1, correlation=corPagel(0.5, mast.cd$phy,fixed=F), method="ML" ) }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+  if(is.null(lamb.i)){
+    lamb.i <- lapply( seq(0,1,length.out=11), function(y){tryCatch({gls(y2 ~ 1, correlation=corPagel(y, mast.cd$phy,fixed=F), method="ML")},error=function(e){cat("ERROR :",conditionMessage(e), "\n")}) })
+    if(all(sapply(lamb.i, is.null) == T)){
+      lamb.i <- lapply( seq(0,1,length.out=11), function(y){tryCatch({gls(y2 ~ 1, correlation=corPagel(y, mast.cd$phy,fixed=T), method="ML") }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")}) })
+    }
+    lamb.i <- lamb.i[which(sapply(lamb.i, is.null) == F)][[which.min(sapply(lamb.i[which(sapply(lamb.i, is.null) == F)],AIC))]]
+  }
+
+   try(if(summary(lamb.i)$modelStruct[1]<0){
+       lamb.i <-try( gls(y2 ~ 1, correlation=corPagel(0,mast.cd$phy,fixed=T), method="ML"))
+       })
+  lamb.null <- gls(y2~1, method="ML")
+   lamb.test <- try(anova(lamb.null, lamb.i))
+   lamb.p <- try(lamb.test$`p-value`[2])
+   if(is.null(lamb.p)){lamb.p <- 1}
+
+#fill in dataframe
+  K.results[rows.i[1],] <- c(vars[i],"K", K.i$K, K.i.se$K, K.i.se$sig2, K.i$P, K.i.se$P, length(mast.cd$phy$tip.label), length(mast.se.cd$phy$tip.label))
+   K.results[rows.i[2],] <- c(vars[i],"Lambda", NA,NA, NA, NA, NA, length(mast.cd$phy$tip.label), length(mast.se.cd$phy$tip.label))
+  try( K.results[rows.i[2],c( "Stat.without.se","p.without.se" )] <- c(summary(lamb.i)$modelStruct[1],lamb.p))
+   try( K.results[rows.i[2],c( "Stat.with.se","p.with.se" )] <- c(summary(lamb.se)$modelStruct[1],lamb.se.p))
+
+   try(rm(lamb.se))
+ try(rm(lamb.i))
+   }
+
+ K.results$dataset <- rep(duration, nrow(K.results))
+ K.results$unit.type <- rep(unit.type, nrow(K.results))
+
+ saveRDS(K.results, file=paste("Phylogenetic_signal_results_", duration, "yrs_", unit.type, ".Rdata", sep=""))
+
+ ## phylogenetic correlation ##
+ corr.results.df <- data.frame("vars"=character(), "R-squared"=numeric(),"r"=numeric(), "coefficient"=numeric(), "p-value"=numeric(), "n"=numeric())
+ mast.cors <- list(c("mean_AR1", "mean_CV"), c("mean_AR1", "mean_spat_global"), c("mean_AR1", "mean_spat_100"), c("mean_CV", "mean_spat_global"), c("mean_CV", "mean_spat_100"), c("mean_spat_global", "mean_spat_100"))
+ for(i in 1:length(mast.cors)){
+   #columns of vars to be correlated
+   cols.i <-c( grep(mast.cors[[i]][1], colnames(mast.df)), grep(mast.cors[[i]][2], colnames(mast.df)))
+
+   #set up comparative data object
+   cor.df <- mast.df[,c(1, cols.i)]
+   cor.df <- cor.df[complete.cases(cor.df),]
+   cor.df$Species <- gsub(" ", "_", cor.df$Species)
+   colnames(cor.df)[2:3] <- c("x", "y")
+   phylo.i <- keep.tip(phylo, cor.df$Species)
+   phylo.i$node.label <- NA
+   cor.cd <- comparative.data(phylo.i, cor.df, names.col = 'Species')
+   #fit pgls
+   try(cor.pgls.i <- pgls(y~x, cor.cd, lambda="ML"))
+   try(cor.summary.i <- summary(cor.pgls.i))
+   #calculate r
+   try(r.i <- sqrt(cor.summary.i$r.squared))
+   try(if(cor.summary.i$coefficients[2,1]<0){r.i <- r.i*-1})
+
+   #put results in table
+   corr.results.df[i,] <- c(paste(mast.cors[[i]][1], mast.cors[[i]][2], sep=" & "), rep(NA, 4), nrow(cor.df))
+   try(corr.results.df[i,2:5] <- c(cor.summary.i$r.squared, r.i, cor.summary.i$coefficients[2,1], cor.summary.i$coefficients[2,4]))
+
+  rm(list=c('cor.pgls.i', 'cor.summary.i'))
+}
+
+corr.results.df$dataset <- rep(duration, nrow(corr.results.df))
+corr.results.df$unit.type <- rep(unit.type, nrow(corr.results.df))
+
+ saveRDS(corr.results.df, file=paste("Phylogenetic_correlation_results_", duration, "yrs_", unit.type, ".Rdata", sep=""))
+
+######################################################
+########### 2. Trait dependent evolution #############
+######################################################
+
+## Analyses to test relationship between masting traits (cv, ar1 and synchrony) and speciation and seed size evolution
+# uses both STRAPP and ESSIM approaches
+
+#### prep BAMM objects#####
+## diversification ##
+#get original phylo tip labels and add "_" so can match to BAMM object
+mast.df$tips_original <- tip.labs.checked$Taxon[match(unlist(mast.df$Species), paste(tip.labs.checked$New.Genus, tip.labs.checked$New.Species, sep=" "))]
+mast.df$tips_original <- gsub(" ", "_", mast.df$tips_original)
+row.names(mast.df) <- mast.df$tips_original
+
+# subset bamm object to species in masting
+mast.BAMM <- subtreeBAMM(Smith.Brown.BAMM, tips = mast.df$tips_original, node = NULL)
+mast.bamm.df <- mast.df[mast.df$tips_original %in% mast.BAMM$tip.label,]
+
+# drop NAs from tip states
+mast.BAMM$tipLambda <- 
+              mast.BAMM$tipLambda[which(sapply(mast.BAMM$tipStates,
+                                                        function(x){any(is.na(x))==F}))]
+mast.BAMM$tipStates <-  
+              mast.BAMM$tipStates[which(sapply(mast.BAMM$tipStates,
+                                   function(x){any(is.na(x))==F}))]
+
+## seed size evolution ##
+# get the masting data to match the bamm object
+seed.df <- mast.df #copy the masting data
+seed.df$tips_original <- seed.names$Taxon[match(unlist(mast.df$Species), seed.names$binomial)]
+seed.df$tips_original <- gsub(" ", "_", seed.df$tips_original)
+seed.df <- seed.df[complete.cases(seed.df$tips_original),]
+rownames(seed.df) <- seed.df$tips_original
+
+# subset bamm object to species in masting
+seed.BAMM <- subtreeBAMM(seed.BAMM.full, tips = seed.df$tips_original, node = NULL)
+seed.df <- seed.df[seed.df$tips_original %in% seed.BAMM$tip.label,]
+
+#### prep for ES-sim analysis #####
+#subset to masting species
+mast.DR <- smith.brownDR[names(smith.brownDR) %in% mast.df$tips_original] #subset to masting species
+
+##### testing associations between speciation/seed evolution and masting traits ####
+#set up dataframe
+trait.divn.results <- data.frame("Variable"=character(), "Evolution.type"=character(),"Method"=character(), "rho"=numeric(), "p"=numeric(), "n"=numeric(), stringsAsFactors = F)
+
+#loop through traits
+for(i in 1:length(vars)){
+  col.i <- grep(vars[i], colnames(mast.df))[1]
+  rows.i <- ((3*i)-2):(3*i)
+  # speciation STRAPP
+  mast.i <- mast.bamm.df[,col.i]
+  names(mast.i) <- row.names(mast.bamm.df)
+  strapp.mast.i <- traitDependentBAMM(mast.BAMM, mast.i, 1000, rate = "speciation", method = "spearman", logrates = F ,two.tailed = TRUE, traitorder = "p", nthreads = 1)
+  trait.divn.results[rows.i[1],] <- c(vars[i], "Speciation", "STRAPP", strapp.mast.i$estimate, strapp.mast.i$p.value, length(mast.i[complete.cases(mast.i)]))
+
+  # seed evolution STRAPP
+  seed.i <- seed.df[,col.i]
+  names(seed.i) <- row.names(seed.df)
+ strapp.seed.i <- traitDependentBAMM(seed.BAMM, seed.i, 1000, rate = "trait", method = "spearman", logrates = F ,two.tailed = TRUE, traitorder = "p", nthreads = 1)
+  trait.divn.results[rows.i[2],] <- c(vars[i], "Trait", "STRAPP", strapp.seed.i$estimate, strapp.seed.i$p.value, length(seed.i[complete.cases(seed.i)]))
+
+  # speciation ES-sim
+  mast.ib <- mast.df[,col.i]
+  names(mast.ib) <- gsub(" ", "_", mast.df$tips_original) #mast.ib has original names
+  mast.ib <- mast.ib[complete.cases(mast.ib)]
+  mast.tree.i <- keep.tip(Smith.brown.tree, names(mast.ib)) #Smith brown tree has unchecked names (unlike "phylo)
+  mast.DR.i <- mast.DR[names(mast.DR) %in% names(mast.ib)]
+  essim.mast.i<- essim(mast.tree.i, mast.ib, nsim=1000, es=mast.DR.i)
+  trait.divn.results[rows.i[3],] <- c(vars[i], "Speciation","ES-sim", essim.mast.i[1], essim.mast.i[2], length(mast.ib[complete.cases(mast.ib)]))
+
+}
+trait.divn.results$dataset <- rep(duration, nrow(trait.divn.results))
+trait.divn.results$unit.type <- rep(unit.type, nrow(trait.divn.results))
+
+saveRDS(trait.divn.results, file=paste("Trait_dependent_diversification_results_masting_", duration, "yrs_", unit.type, ".Rdata", sep=""))
+
+########################################################################
+########### 3. Compare masting data to non-mastree species #############
+########################################################################
+#make column for masting species in tip evolution dataframe
+ tip.evolution.df$masting <- rep(0, nrow(tip.evolution.df))
+ tip.evolution.df$masting[tip.evolution.df$tip %in% mast.df$tips_original] <- 1
+ tip.evolution.df$masting <- as.factor(tip.evolution.df$masting)
+
+# drop NAs from tip states
+Smith.Brown.BAMM$tipLambda <-
+  Smith.Brown.BAMM$tipLambda[which(sapply(Smith.Brown.BAMM$tipStates,
+                                   function(x){any(is.na(x))==F}))]
+Smith.Brown.BAMM$tipStates <-
+  Smith.Brown.BAMM$tipStates[which(sapply(Smith.Brown.BAMM$tipStates,
+                                   function(x){any(is.na(x))==F}))]
+
+# strapp masting and lambda
+# speciation STRAPP
+lambda.j <- tip.evolution.df$masting
+names(lambda.j) <- tip.evolution.df$tip
+lambda.j <- lambda.j[complete.cases(tip.evolution.df$lambda)]
+
+  tip.evolution.df[tip.evolution.df$tip %in% Smith.Brown.BAMM$tip.label,]
+Smith.Brown.BAMM.j <- subtreeBAMM(Smith.Brown.BAMM, tips = lambda.j, node = NULL)
+
+strapp.lambda.j <- traitDependentBAMM(Smith.Brown.BAMM.j, lambda.j, 1,
+                                      rate = "speciation", method = "mann-whitney", logrates = F ,two.tailed =
+                                        TRUE, traitorder = "1")
+
+# seed evolution STRAPP
+# subset bamm object to species in masting
+seed.j <- tip.evolution.df$masting
+names(seed.j) <- tip.evolution.df$tip
+seed.j <- seed.j[names(seed.j) %in% seed.BAMM.full$tip.label]
+seed.BAMM.j <- subtreeBAMM(seed.BAMM.full, tips = names(seed.j), node = NULL)
+
+seed.j <- seed.j[names(seed.j)%in% seed.BAMM.j$tip.label]
+strapp.seed.j <- traitDependentBAMM(seed.BAMM.j, seed.j, 1000, rate = "trait", method = "mann-whitney", logrates = F ,two.tailed = TRUE, traitorder = c("0","1"), nthreads = 1)
+
+## phylo glms for age and dr
+## age ##
+#rescale variables and log transform for using in phyloglm
+ tip.evolution.df$age.scaled <- scale(log(tip.evolution.df$tip.age))
+ tip.evolution.df$dr.scaled <- scale(log(tip.evolution.df$dr))
+
+age.glm1 <- phyloglm(masting~age.scaled, phy=Smith.brown.tree, data=tip.evolution.df, method="logistic_MPLE",start.alpha = 0.01, log.alpha.bound =6, btol=20)
+dr.glm1 <- phyloglm(masting~dr.scaled, phy=Smith.brown.tree, data=tip.evolution.df, method="logistic_MPLE", start.alpha = 0.0001, log.alpha.bound =6, btol = 30)
+
+#put results in dataframe
+bias.df <- data.frame("Variable"=character(), "method"=character(), "coefficient"=numeric(), "p-value"=numeric(), "median.mastree"=numeric(), "median.non-mastree"=numeric(), "N"=numeric())
+
+bias.df[1,] <- c("age", "phyloglm", summary(age.glm1)$coefficients[2,1], summary(age.glm1)$coefficients[2,4], NA, NA, nrow(tip.evolution.df))
+bias.df[2,] <- c("lambda", "STRAPP", NA, strapp.lambda.j$p.value, unlist(strapp.lambda.j$estimate), length(lambda.j))
+bias.df[3,] <- c("seed mass change", "STRAPP", NA, strapp.seed.j$p.value, unlist(strapp.seed.j$estimate), length(seed.j))
+bias.df[4,] <- c("dr", "phyloglm", summary(dr.glm1)$coefficients[2,1], summary(dr.glm1)$coefficients[2,4], NA, NA, nrow(tip.evolution.df))
+
+bias.df$dataset <- rep(duration, nrow(bias.df))
+bias.df$unit.type <- rep(unit.type, nrow(bias.df))
+
+saveRDS(bias.df, file=paste("Macroevolutionary_bias_mastree_data_", duration, "yrs_", unit.type, ".Rdata", sep=""))
+
+### plots ###
+masting.colours <-c("#046C9A", "#F2300F")
+
+pdf(file=paste("Fig 1 boxplots of mastree and non-mastree macroevolutionary rates ", duration,"yrs ", unit.type, ".pdf", sep=""), height = 6, width = 6)
+par(mfrow=c(2,2), mar=c(4,4.1,1,1.5))
+# tip age
+boxplot(tip.age~masting, data=tip.evolution.df, main="", ylab="Species age (Ma)", log="y", xaxt="n", yaxt="n", col=masting.colours, xlab="")
+axis(1,at=c(1,2), labels=c("non-MASTREE+", "MASTREE+"), cex.axis=0.8)
+title(xlab="Species", line=2.25)
+axis(2, at=c(0.001, 0.1, 10), labels=c(0.001, 0.1, 10))
+text(0.45, 0.95*max(tip.evolution.df$tip.age), "a)", pos=4)
+text(1.5,exp(-6.5), paste("Coefficient =", round(as.numeric(bias.df$coefficient[1]), digits = 2)), pos=4, cex=0.75)
+text(1.5,exp(-7.55), paste("p-value =", round(as.numeric(bias.df$p.value[1]), digits = 2)), pos=4, cex=0.75)
+
+# lambda
+boxplot(lambda~masting, data=tip.evolution.df, main="", ylab="Rate of speciation (spp./Ma)", log="y", xaxt="n", yaxt="n", col=masting.colours, xlab="")
+title(xlab="Species", line=2.25)
+axis(1,at=c(1,2), labels=c("non-MASTREE+", "MASTREE+"), cex.axis=0.8)
+axis(2, at=c(0.005, 0.05, 0.5, 5), labels=c(0.005, 0.05, 0.5, 5))
+text(0.45, exp(0.95*max(log(tip.evolution.df$lambda), na.rm = T)), "b)", pos=4)
+text(1.2,exp(0.9*max(log(tip.evolution.df$lambda), na.rm = T)), "Median rates:", pos=4, cex=0.75)
+text(1.3,exp(0.75*max(log(tip.evolution.df$lambda), na.rm = T)), paste("non-MASTREE+ =", round(as.numeric(bias.df$median.non-mastree[2]), digits = 2)), pos=4, cex=0.75)
+text(1.3,exp(0.60*max(log(tip.evolution.df$lambda), na.rm = T)), paste("MASTREE+ =", round(as.numeric(bias.df$median.mastree[2]), digits = 2)), pos=4, cex=0.75)
+text(1.2,exp(0.45*max(log(tip.evolution.df$lambda), na.rm = T)), paste("p-value =", round(as.numeric(bias.df$p.value[2]), digits = 2)), pos=4, cex=0.75)
+
+# seed mass change
+boxplot(beta~masting, data=tip.evolution.df, main="", ylab="Rate of seed mass change", log="y",
+        xaxt="n", yaxt="n", col=masting.colours, xlab="")
+title(xlab="Species", line=2.25)
+axis(1,at=c(1,2), labels=c("non-MASTREE+", "MASTREE+"), cex.axis=0.8)
+axis(2, at=c(0.005, 0.05, 0.5, 5), labels=c(0.005, 0.05, 0.5, 5))
+text(0.45, exp(0.95*max(log(tip.evolution.df$beta), na.rm = T)), "c)", pos=4)
+text(1.2,exp(0.9*max(log(tip.evolution.df$beta), na.rm = T)), "Median rates:", pos=4, cex=0.75)
+text(1.3,exp(0.73*max(log(tip.evolution.df$beta), na.rm = T)), paste("non-MASTREE+ =", round(as.numeric(bias.df$median.non-mastree[3]), digits = 2)), pos=4, cex=0.75)
+text(1.3,exp(0.56*max(log(tip.evolution.df$beta), na.rm = T)), paste("MASTREE+ =", round(as.numeric(bias.df$median.mastree[3]), digits = 2)), pos=4, cex=0.75)
+text(1.2,exp(0.39*max(log(tip.evolution.df$beta), na.rm = T)), paste("p-value =", round(as.numeric(bias.df$p.value[3]), digits = 2)), pos=4, cex=0.75)
+
+# DR
+boxplot(dr~masting, data=tip.evolution.df, main="", ylab="Diversification rate metric (DR, spp./Ma)", log="y",
+        xaxt="n", yaxt="n",  col=masting.colours, xlab="")
+title(xlab="Species", line=2.25)
+axis(1,at=c(1,2), labels=c("non-MASTREE+", "MASTREE+"), cex.axis=0.8)
+axis(2, at=c(0.01, 0.1, 1, 10, 100), labels=c(0.01, 0.1, 1, 10, 100))
+text(0.45, exp(0.95*max(log(tip.evolution.df$dr), na.rm = T)), "d)", pos=4)
+text(1.5,exp(0.9*max(log(tip.evolution.df$dr), na.rm = T)), paste("Coefficient =", round(as.numeric(bias.df$coefficient[4]), digits = 2)), pos=4, cex=0.75)
+text(1.5,exp(0.8*max(log(tip.evolution.df$dr), na.rm = T)), "p-value < 0.001", pos=4, cex=0.75)
+
+dev.off()
+
+######################################################
+############### 4. Cluster analysis #####################
+######################################################
+#generate dissimilarity matrix using Gower's distance
+mast.clust <- daisy(mast.df[,c(4,6)], metric="gower")
+
+#determine within-cluster sum of squares
+WCSS <- c()
+for(i in 2:12){
+  km <- kmeans(mast.clust, i)
+  WCSS <- c(WCSS, mean(km$withinss))
+}
+
+#plot to identify elbow
+plot.name <- paste("Elbow plot masting clusters ", duration, "yrs ", unit.type, ".pdf", sep="")
+pdf(file=plot.name)
+plot(2:12, WCSS, pch=19, xlab="Number of clusters", ylab="Mean sum of squares")
+lines(2:12, WCSS)
+dev.off()
+
+# will use 5 clusters going forward
+no.clusters <- 5
+mast.clust <- kmeans(mast.clust, no.clusters)
+
+#add cluster to masting data
+mast.df$cluster <- as.factor(mast.clust$cluster)
+
+#add in clusters
+tip.evolution.df$cluster <- rep(0, nrow(tip.evolution.df))
+for(i in 1:no.clusters){
+  tip.evolution.df$cluster[tip.evolution.df$tip %in% mast.df$tips_original[mast.df$cluster==i]] <- i
+}
+tip.evolution.df$cluster <- as.factor(tip.evolution.df$cluster)
+
+##################################################################
+################# 5. Comparing clusters ##########################
+##################################################################
+### set up comparative data objects for pgls ###
+clust.df <- tip.evolution.df[!tip.evolution.df$cluster==0,]
+clust.df$cluster <- droplevels(clust.df$cluster)
+
+#change tip names to standardised names to match phylo
+clust.df$tip <- mast.df$Species[match(unlist(mast.df$tips_original), clust.df$tip)]
+clust.df$tip <- gsub(" ", "_", clust.df$tip)
+
+# for evolutionary metrics
+clust.cd <- comparative.data(phylo, clust.df[,c(1,2,5,9)], names.col = tip)
+
+#for masting metrics
+mast.df$Species <- gsub(" ", "_", mast.df$Species)
+mast.lat.cd <- comparative.data(phylo, mast.df[,c(1,11,12,13,26)], names.col = Species)
+mast.spat.cd <- comparative.data(phylo, mast.df[,c(1,16, 26)], names.col = Species)
+mast.spat100.cd <- comparative.data(phylo, mast.df[,c(1,15,26)], names.col = Species)
+
+## subset BAMM object with lambda to species in masting for STRAPP analysis ##
+mast.clusters.bamm <- mast.df$cluster
+names(mast.clusters.bamm) <- mast.df$tips_original
+mast.clusters.bamm <- mast.clusters.bamm[names(mast.clusters.bamm) %in% mast.BAMM$tip.label]
+
+## subset BAMM object with beta to species in masting data for STRAPP analysis##
+# get the masting data to match the bamm object
+seed.clusters <- mast.df$cluster #copy the masting data
+names(seed.clusters) <- mast.df$tips_original
+seed.clust.BAMM <- subtreeBAMM(seed.BAMM.full, tips = names(seed.clusters), node = NULL)
+seed.clusters <- seed.clusters[names(seed.clusters) %in% seed.clust.BAMM$tip.label]
+
+####### model fitting ############
+## synchrony - pgls ##
+try(s.pgls2 <-  pgls(exp(mean_spat_global)~cluster, data=mast.spat.cd, lambda = "ML"))
+try(s100.pgls2 <-  pgls(exp(mean_spat_100)~cluster, data=mast.spat100.cd, lambda = "ML"))
+
+## latitude - pgls ##
+try(lat.pgls1 <-  pgls(mean_latitude_absolute~cluster, data=mast.lat.cd, lambda = "ML"))
+
+## age - pgls ##
+try(age.pgls1 <-  pgls(log(tip.age)~cluster, data=clust.cd, lambda = "ML"))
+
+## lambda (speciation rate) - STRAPP ##
+try(strapp.mast.clust <- traitDependentBAMM(mast.BAMM, mast.clusters.bamm, 1000, rate = "speciation", method = "kruskal", logrates = F ,two.tailed = TRUE, nthreads = 1))
+
+## seed size evoul (beta) - STRAPP ##
+try(strapp.seed.clust <- traitDependentBAMM(seed.clust.BAMM, seed.clusters, 1000, rate = "trait", method = "kruskal", logrates = F ,two.tailed = TRUE, nthreads = 1))
+
+## DR - pgls ##
+try(dr.pgls1 <-  pgls(log(dr)~cluster, data=clust.cd, lambda = "ML"))
+
+### save outputs ###
+# macroevoulutionary rates and masting metrics
+  #fills in the run info, then model results separately, in case the model didn't work
+age.row.j <- c("age", "pgls", rep(NA, 10), nrow(clust.cd$data))
+try(age.row.j[3:7] <- c(summary(age.pgls1)$fstatistic[2], summary(age.pgls1)$fstatistic[3],summary(age.pgls1)$fstatistic[1],
+               summary(age.pgls1)$r.squared, p.value(age.pgls1) ))
+
+lamb.row.j <- c("lambda", "STRAPP", rep(NA, 10),length(mast.clusters.bamm))
+try(lamb.row.j[7:12] <- c(strapp.mast.clust$p.value, unlist(strapp.mast.clust$estimate)))
+
+seed.row.j <- c("beta", "STRAPP", rep(NA, 10),length(seed.clusters))
+try(seed.row.j[7:12] <- c(strapp.seed.clust$p.value, unlist(strapp.seed.clust$estimate)))
+
+dr.row.j <- c("dr", "pgls", rep(NA, 10), nrow(clust.cd$data))
+try(dr.row.j[3:7] <- c(summary(dr.pgls1)$fstatistic[2], summary(dr.pgls1)$fstatistic[3],summary(dr.pgls1)$fstatistic[1],
+              summary(dr.pgls1)$r.squared, p.value(dr.pgls1)))
+
+s.row.j <- c("s_global", "pgls", rep(NA, 10), nrow(mast.spat.cd$data))
+try(s.row.j[3:7] <- c(summary(s.pgls2)$fstatistic[2], summary(s.pgls2)$fstatistic[3],summary(s.pgls2)$fstatistic[1],
+             summary(s.pgls2)$r.squared, p.value(s.pgls2)))
+
+s100.row.j <- c("s_100", "pgls", rep(NA, 10), nrow(mast.spat100.cd$data))
+try(s100.row.j[3:7] <- c(summary(s100.pgls2)$fstatistic[2], summary(s100.pgls2)$fstatistic[3],summary(s100.pgls2)$fstatistic[1],
+                summary(s100.pgls2)$r.squared, p.value(s100.pgls2)))
+
+lat.row.j <- c("latitude", "pgls", rep(NA, 10), nrow(mast.lat.cd$data))
+try(lat.row.j[3:7] <- c(summary(lat.pgls1)$fstatistic[2], summary(lat.pgls1)$fstatistic[3],summary(lat.pgls1)$fstatistic[1],
+               summary(lat.pgls1)$r.squared, p.value(lat.pgls1)))
+
+ cluster.results <- data.frame("rate"=character(), "method"=character(), "df1"=numeric(), "df2"=numeric(),
+                                 "F"=numeric(), "R2"=numeric(), "p"=numeric(), "median_A"=numeric(), "median_B"=numeric(), 
+                                "median_C"=numeric(), "median_D"=numeric(), "median_E"=numeric(), "N"=numeric() )
+  cluster.results [1,]<- age.row.j
+  cluster.results [2,]<- lamb.row.j
+  cluster.results [3,]<- seed.row.j
+  cluster.results [4,]<- dr.row.j
+  cluster.results [5,]<- s.row.j
+  cluster.results [6,]<- s100.row.j 
+  cluster.results [7,]<- lat.row.j
+
+  cluster.results$dataset <- rep(duration, nrow(cluster.results))
+  cluster.results$unit.type <- rep(unit.type, nrow(cluster.results))
+  
+saveRDS(cluster.results, file=paste("Macroevolutionary_rates_cluster_test_results_", duration, "yrs_", unit.type, ".Rdata", sep=""))
+
+try(rm(s.pgls2))
+try(rm(s100.pgls2))
+try(rm(lat.pgls1))
+try(rm(dr.pgls1))
+try(rm(strapp.seed.clust))
+try(rm(strapp.mast.clust))
+try(rm(age.pgls1))
+
+#############################################
+#### Fig 3 cluster plots masting metrics ####
+#############################################
+cluster.cols <- c("#009E73", "#F0E442", "#57B4E9", "#D55E00", "#E69F00")[1:no.clusters]
+
+ plot.name <- paste("Fig 3 cluster plots ", no.clusters, " clusters ", duration, "yrs ", unit.type, ".pdf", sep="")
+ pdf(file=plot.name, height=4.5, width=7)
+
+ layout(rbind(c(rep(1,4),rep(2,3)),
+              c(rep(1,4),rep(2,3)),
+              c(rep(1,4),rep(3,3)),
+              c(rep(1,4),rep(3,3))))
+
+ #scatterplot of clusters
+ par(mar=c(5.1,4.1,2.1,0.5))
+ plot(mast.df$mean_CV~mast.df$mean_AR1, ylab="Mean CVp", xlab="Mean AR1", type="n")
+ points(mast.df$mean_CV[mast.df$cluster==1]~mast.df$mean_AR1[mast.df$cluster==1], bg=cluster.cols[1], pch=21)
+ points(mast.df$mean_CV[mast.df$cluster==2]~mast.df$mean_AR1[mast.df$cluster==2], bg=cluster.cols[2], pch=21)
+ points(mast.df$mean_CV[mast.df$cluster==3]~mast.df$mean_AR1[mast.df$cluster==3], bg=cluster.cols[3], pch=21)
+ points(mast.df$mean_CV[mast.df$cluster==4]~mast.df$mean_AR1[mast.df$cluster==4], bg=cluster.cols[4], pch=21)
+ points(mast.df$mean_CV[mast.df$cluster==5]~mast.df$mean_AR1[mast.df$cluster==5], bg=cluster.cols[5], pch=21)
+
+ #legend
+ text(-0.9, 2.43, "Clusters", pos=4)
+ text(rep(-0.85,no.clusters), seq(from=2.35, by=-0.08, length.out = no.clusters), LETTERS[1:no.clusters], pos=4, cex=0.75)
+ points(rep(-0.85,no.clusters), seq(from=2.35, by=-0.08, length.out = no.clusters), pch=21, bg=cluster.cols)
+ text(-0.92, 2.65, "a)", pos=4)
+
+ # boxplot synchrony
+ par(mar=c(4.1,4.1,2.1,1))
+ boxplot(mean_spat_global~cluster, data=mast.df, col=cluster.cols, xaxt="n", ylab="Mean synchrony", xlab="")
+ axis(1, at=1:no.clusters,labels = LETTERS[1:no.clusters])
+ text(0.3, 0.95, "b)", pos=4)
+ text(0.3, -0.65, f.fig(s.pgls2), pos=4, cex=0.75)
+ text(0.3,-0.80, bquote(paste("R"^"2", "=", .(r.sqr(s.pgls2)))), pos=4, cex=0.75)
+ text(0.3,-0.95, paste("p-value =", p.value(s.pgls2)), pos=4, cex=0.75)
+ #text(0.3,-0.95, "p-value = 0.90", pos=4, cex=0.75)
+
+ #boxplot mean latitude
+ par(mar=c(5.1,4.1,0,1))
+ boxplot(mean_latitude_absolute~cluster, data=mast.df, col=cluster.cols, xaxt="n", ylab="Absolute latitude (°)", xlab="Cluster", ylim=c(0,90))
+ axis(1, at=1:no.clusters,labels = LETTERS[1:no.clusters])
+ text(0.3, 0.95*90, "c)", pos=4)
+ text(4, 88, f.fig(lat.pgls1), pos=4, cex=0.75)
+ text(4, 81, bquote(paste("R"^"2", "=", .(r.sqr(lat.pgls1)))), pos=4, cex=0.75)
+ text(4,74, paste("p-value = ", p.value(lat.pgls1)), pos=4, cex=0.75)
+
+ dev.off()
+
+### plotting cluster differences ###
+fig.name <- paste("Fig 4 macroevolution boxplots by cluster ", no.clusters," clusters ", duration, "yrs ", unit.type, ".pdf", sep="")
+ pdf(file=fig.name, height=6, width = 6)
+ par(mfrow=c(2,2), mar=c(4,4.1,1,1.5))
+ #age
+ boxplot(tip.age~cluster, data=clust.df, col=cluster.cols, log="y", xaxt="n", yaxt="n", xlab="", ylab="Species age (Ma)", ylim=c(0.001,100))
+ title(xlab="Cluster", line=2.5)
+ axis(1, at=1:no.clusters,labels = LETTERS[1:no.clusters])
+ axis(2, at=c(0.001,0.1,1,10,100),labels = c(0.001,0.1,1,10,100))
+ text(0.3, 0.95*max(clust.df$tip.age), "a)", pos=4)
+ text(no.clusters-1.9, exp(-5.5), f.fig(age.pgls1), pos=4, cex=0.75)
+ text(no.clusters-1.9,exp(-6.2), bquote(paste("R"^"2", "=", .(r.sqr(age.pgls1)))), pos=4, cex=0.75)
+ text(no.clusters-1.9,exp(-6.9), paste("p-value = ", p.value(age.pgls1)), pos=4, cex=0.75)
+
+ #lambda (speciation rate)
+ l <- boxplot(lambda~cluster, data=clust.df, col=cluster.cols, xaxt="n", ylab="Rate of speciation (spp./Ma)", xlab="")
+ title(xlab="Cluster", line=2.5)
+ axis(1, at=1:no.clusters,labels = LETTERS[1:no.clusters])
+ text(0.3, 0.95*max(clust.df$lambda, na.rm = T), "b)", pos=4)
+ text(no.clusters-1.75, 2.1, paste("p-value = ", round(strapp.mast.clust$p.value, digits=2)), pos=4, cex=0.75)
+ for(i in 1:no.clusters){
+   est.number <- grep(i, names(strapp.mast.clust$estimate))
+   est <- round(as.numeric(strapp.mast.clust$estimate[est.number]), digits=2)
+   if(nchar(est)==3){est <- paste(est, "0", sep="")}
+   y.pos <- mean(c(l$stats[3,i],l$stats[4,i]))
+   text(i, y.pos, est, cex=0.75)
+ }
+
+
+ # beta (seed mass evolution rate)
+ b <- boxplot(beta~cluster, data=clust.df, col=cluster.cols, log="y", xaxt="n", ylab="Rate of seed mass change", xlab="")
+ axis(1, at=1:no.clusters,labels = LETTERS[1:no.clusters])
+ title(xlab="Cluster", line=2.5)
+ text(0.3, 0.95*max(clust.df$beta, na.rm = T), "c)", pos=4)
+ text(no.clusters-1.7, 0.009, paste("p-value = ", round(strapp.seed.clust$p.value, digits=2)), pos=4, cex=0.75)
+ for(i in 1:no.clusters){
+   est.number <- grep(i, names(strapp.seed.clust$estimate))
+   est <- round(as.numeric(strapp.seed.clust$estimate[est.number]), digits=2)
+   if(nchar(est)==3){est <- paste(est, "0", sep="")}
+   y.pos <- mean(c(b$stats[3,i],b$stats[4,i]))
+   text(i, y.pos, est, cex=0.75)
+ }
+ # DR (diversification rate)
+ boxplot(dr~cluster, data=clust.df, col=cluster.cols, log="y",  xaxt="n", ylab="Diversification rate metric (DR, spp./Ma)",
+         xlab="", ylim=c(00.008,max(clust.df$dr)))
+ axis(1, at=1:no.clusters,labels = LETTERS[1:no.clusters])
+ title(xlab="Cluster", line=2.5)
+ text(0.3, 0.95*max(clust.df$dr), "d)", pos=4)
+ text(no.clusters-4.7, exp(-4.2), f.fig(dr.pgls1), pos=4, cex=0.75)
+ text(no.clusters-4.7,exp(-4.55), bquote(paste("R"^"2", "=", .(r.sqr(dr.pgls1)))), pos=4, cex=0.75)
+ text(no.clusters-4.7,exp(-4.9), paste("p-value = ", p.value(dr.pgls1)), pos=4, cex=0.75)
+
+ dev.off()
+
+}#end of j loop
