@@ -7,6 +7,5 @@ The analysis proceeds as follows:
 2. Standardising names and generating datasets.R
 3. Masting macroevolution analyses full.R
 4. Fig 2 script.R
+
 The remaining files contain functions used by the scripts above.
-
-
